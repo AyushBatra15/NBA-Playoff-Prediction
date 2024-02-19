@@ -1,0 +1,181 @@
+---
+title: "NBA Playoff Experience"
+author: "Ayush Batra"
+format: html
+editor: visual
+---
+
+## Loading Packages
+
+Here are the packages that I use in this notebook.
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(tidyverse)   # for data manipulation
+library(nbastatR)    # Load NBA data
+
+# increase size of connection buffer to be able to load box score data
+Sys.setenv("VROOM_CONNECTION_SIZE" = 2*131072)
+```
+
+## Experience Calculation Functions
+
+The code below has the functions that are used to calculate the team playoff experience. Basically, here were the steps:
+
+-   1: filter the playoff game logs so they only contain games prior to the given season
+
+-   2: calculate the total playoff minutes among players that played in the given season
+
+-   3: get an estimate of a team's rotation by taking the top 10 current players in minutes per game among those with at least 5 games played for the team
+
+-   4: calculate playoff experience of a team as its weighted average of playoff minutes among the players in its rotation, where the weights are proportion to minutes per game
+
+```{r}
+#| label: functions
+
+# This function calculates the playoff experience for each team
+# in the given season. 
+# Arguments:
+#     season: season to get experience for
+#     playoff_logs: df of player playoff game logs for which to gather
+#                   experience from
+#     absent_list: list of players that did not participate in the playoffs
+#                  in the given season (will not include these players in
+#                  experience calculations)
+#     byPlayer: indicator to tell function to return playoff experience
+#               by player or by team
+getExperience <- function(season, playoff_logs, absent_list = c(),
+                          byPlayer = FALSE) {
+  # look at only playoff games that occurred BEFORE the given season
+  playoff_logs2 <- playoff_logs %>%
+    filter(yearSeason < season)
+  # get regular season player game logs for season
+  rs_player_logs <- getRSLogs(season)
+  # get vector of players that played in the regular season
+  valid <- rs_player_logs %>% distinct(idPlayer) %>% pull(idPlayer)
+  # count total playoff minutes for each (valid) player
+  player_playoff_counts <- playerExperience(playoff_logs2, valid)
+  # get the estimated team rotation for given season
+  team_rotation <- getTeamRotation(rs_player_logs, absent_list)
+  
+  # get player playoff experience, player team, player mins per game
+  team_players_playoffs <- team_rotation %>%
+    # join playoff minutes to team rotation
+    left_join(player_playoff_counts, by = c("idPlayer", "namePlayer")) %>%
+    mutate(sumMIN = ifelse(is.na(sumMIN), 0, sumMIN)) %>%
+    # filter out players without enough games (5 is an arbitrary number)
+    filter(G > 5) %>%
+    # include only top 10 players in terms of minutes per game 
+    # why: playoff rotation likely will be way shorter than reg. season 
+    #      rotation
+    group_by(slugTeam) %>%
+    mutate(Rk = rank(-Min_G)) %>%
+    filter(Rk <= 10) %>%
+    ungroup() %>%
+    arrange(-Min_G)
+  
+  if (byPlayer) {
+    return(team_players_playoffs)
+  }
+  
+  # get team playoff experience as weighted avg of playoff minutes
+  # where the weights are proportional to mins per game
+  team_playoff_exp <- team_players_playoffs %>%
+    group_by(slugTeam) %>%
+    summarize(experience = weighted.mean(sumMIN, w = Min_G)) %>%
+    ungroup() %>%
+    arrange(-experience)
+  
+  return(team_playoff_exp)
+}
+
+
+
+getRSLogs <- function(season) {
+  # loads regular season game logs for given season
+  rs_player_logs <- game_logs(seasons = season,
+                              result_types = "player",
+                              season_types = "Regular Season")
+  return(rs_player_logs)
+}
+
+mostRecentTeams <- function(rs_player_logs) {
+  # gets team that each player most recently played for
+  # relevant for players that switched teams mid-season
+  most_recent_team <- rs_player_logs %>%
+    arrange(desc(dateGame)) %>%
+    select(idPlayer, slugTeam) %>%
+    group_by(idPlayer) %>%
+    summarize(currentTeam = first(slugTeam)) %>%
+    ungroup()
+  return(most_recent_team)
+}
+
+playerExperience <- function(playoff_logs, valid) {
+  # counts total playoff minutes for each player
+  player_playoff_counts <- playoff_logs %>%
+    filter(idPlayer %in% valid) %>%
+    group_by(namePlayer, idPlayer) %>%
+    summarize(sumMIN = sum(minutes)) %>%
+    ungroup() 
+  return(player_playoff_counts)
+}
+
+getTeamRotation <- function(rs_player_logs, absent_list = c()) {
+  # get most recent team for each player
+  most_recent_team <- mostRecentTeams(rs_player_logs)
+  
+  # get estimated team rotation
+  team_rotation <- rs_player_logs %>%
+    # filter out absent players
+    filter(namePlayer %in% absent_list == FALSE) %>%
+    # calculate games, minutes, mins per game 
+    group_by(idPlayer, namePlayer, slugTeam) %>%
+    summarize(G = n(),
+              Min = sum(minutes)) %>%
+    ungroup() %>%
+    mutate(Min_G = Min / G) %>%
+    # include only players playing with current team
+    left_join(most_recent_team, by = "idPlayer") %>%
+    filter(slugTeam == currentTeam) %>%
+    select(-currentTeam)
+  return(team_rotation)
+}
+
+```
+
+## Gather Stats
+
+With this function, we can gather the playoff experience stats for all relevant seasons. For the playoff logs, I included all player games from 1991 to 2023. The earliest season of playoff experience needed is 2011, and I figured that all players who played in 2011 had their first playoff minutes in 1991 or later since 1991 was a whole 20 seasons earlier. For seasons prior to this one, I assumed all players that played in the regular season were available for the playoffs (which is obviously not always true, but I didn't feel it was worth it to examine each case individually and find players injured during the postseason). For 2024, I included a vector of players that are out for the season, and therefore will definitely not be playing in the playoffs. These players are excluded from calculations.
+
+```{r}
+#| label: gather
+#| message: false
+#| warning: false
+
+# get playoff logs from 1991 onward
+# 1991 is 20 years before 2011, so its a safe lower bound to include all
+# players from 2011 onwards that played in playoffs
+playoff_logs <- game_logs(seasons = c(1991:2023),
+                          result_types = "player",
+                          season_types = c("Playoffs"))
+
+# get experience for each season
+exp_df <- tibble()
+for (i in c(2011:2023)) {
+  year_exp <- getExperience(i, playoff_logs)
+  year_exp <- year_exp %>% mutate(season = i)
+  exp_df <- rbind(exp_df, year_exp)
+}
+write_csv(exp_df, "data/nba_experience.csv")
+
+# get experience for this year, using knowledge of players out for season
+absent <- c("Ja Morant", "Steven Adams", "Robert Williams III", "Zach LaVine")
+
+exp_df <- getExperience(2024, playoff_logs, absent)
+write_csv(exp_df, "data/nba_exp_2024.csv")
+
+```

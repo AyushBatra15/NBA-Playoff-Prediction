@@ -1,0 +1,411 @@
+---
+title: "All-NBA Modeling"
+author: "Ayush Batra"
+format: html
+editor: visual
+---
+
+## Loading Packages and Data
+
+Here are the packages that I use in this notebook.
+
+```{r}
+#| label: packages
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(nbastatR)
+library(knitr)
+Sys.setenv("VROOM_CONNECTION_SIZE" = 2*131072)
+```
+
+This next code block loads in the dataset of actual All-NBA voting shares along with the regular season player logs for all seasons from 2000 to 2024. The goal of this is to use regular season player stats to predict All-NBA voting shares from 2000 to 2023. At the end, we can use the model to predict the All-NBA voting shares for this year (if there were no 65 game minimum for awards, which is a new rule that began in the 2023-24 season).
+
+```{r}
+#| label: load-data
+#| message: false
+#| warning: false
+
+allnba <- read_csv("data/allnba.csv")
+
+
+player_logs <- game_logs(seasons = 2000:2024,
+                         result_types = "player",
+                         season_types = "Regular Season")
+
+# variable for total number of All-NBA voting shares per season
+# its 9 since 1st-team votes get 5 points, 2nd-team votes get 3 points,
+# and 3rd-team votes get 1 point
+TOTAL_SHARES = 9
+```
+
+## Data Cleaning
+
+This first part just generates some dataframes for player ids and team seasons.
+
+```{r}
+#| label: id-dfs
+
+# get dataframe of player ids and names
+player_data <- player_logs %>%
+  distinct(idPlayer, namePlayer) %>%
+  distinct(idPlayer, .keep_all = TRUE)
+
+# get team game counts
+teams_data <- player_logs %>%
+  distinct(slugTeam, idGame, yearSeason) %>%
+  group_by(slugTeam, yearSeason) %>%
+  summarize(teamG = n()) %>%
+  ungroup()
+```
+
+To predict All-NBA shares, I used player counting stats (scaled per 100 possessions) in addition to stats about playing time. First, we aggregate the stats for each player in each season.
+
+```{r}
+#| label: player-stats
+
+# aggregate relevant player stats for each player season
+player_stats <- player_logs %>%
+  group_by(idGame, idTeam) %>%
+  mutate(TmMIN = sum(minutes),
+         TmPOSS = sum(fga) + sum(tov) + 0.44 * sum(tov) - sum(oreb)) %>%
+  ungroup() %>%
+  mutate(PlayerPOSS = minutes / (TmMIN / 5) * TmPOSS) %>%
+  arrange(dateGame) %>%
+  select(-pctFG, -pctFG3, -pctFG2, -pctFT, -hasVideo) %>%
+  group_by(idPlayer, yearSeason) %>%
+  summarize(G = n(),
+            Tm = last(slugTeam),
+            Min_Pct = sum(minutes) / sum(TmMIN / 5),
+            WP = mean(isWin),
+            POSS = sum(PlayerPOSS),
+            across(fgm : pts, ~ sum(.x))) %>%
+  ungroup() %>%
+  left_join(teams_data, by = c("Tm" = "slugTeam", "yearSeason")) %>%
+  mutate(pct_G = G / teamG) %>%
+  left_join(player_data, by = "idPlayer")
+```
+
+There is a little bit of cleaning to do with the All-NBA data. Some of the names don't match up with the game logs data. The code below edits the names so that they do match up.
+
+```{r}
+#| label: name-cleaning
+
+# see which names have to be cleaned
+allnba %>%
+  filter(Season >= 2000) %>%
+  anti_join(player_stats, by = c("Player" = "namePlayer", 
+                                 "Season" = "yearSeason")) %>%
+  distinct(Player)
+
+# clean some of the names
+allnba2 <- allnba %>%
+  select(Player, Season, Share) %>%
+  mutate(Player = str_remove(Player, "[*]")) %>%
+  mutate(Player = case_when(
+    Player == "Steve Smith" ~ "Steven Smith",
+    Player == "Peja Stojaković" ~ "Peja Stojakovic",
+    Player == "Manu Ginóbili" ~ "Manu Ginobili",
+    Player == "Nenad Krstić" ~ "Nenad Krstic",
+    Player == "Hedo Türkoğlu" ~ "Hedo Turkoglu",
+    Player == "Nenê" ~ "Nene",
+    Player == "Ömer Aşık" ~ "Omer Asik",
+    Player == "J.J. Hickson" ~ "JJ Hickson",
+    Player == "Nikola Peković" ~ "Nikola Pekovic",
+    Player == "Nikola Vučević" ~ "Nikola Vucevic",
+    Player == "Goran Dragić" ~ "Goran Dragic",
+    Player == "Nikola Jokić" ~ "Nikola Jokic",
+    Player == "Kristaps Porziņģis" ~ "Kristaps Porzingis",
+    Player == "Luka Dončić" ~ "Luka Doncic",
+    .default = Player
+  ))
+
+# verify that all names match up
+allnba2 %>%
+  filter(Season >= 2000) %>%
+  anti_join(player_stats, by = c("Player" = "namePlayer", 
+                                 "Season" = "yearSeason")) %>%
+  distinct(Player)
+```
+
+Next, we join the All-NBA voting shares data to the player stats, and normalize the counting stats to be per 100 possessions. In addition, we filter out players that did not play enough.
+
+```{r}
+#| label: normalize-stats
+
+# join all-nba stats to player stats
+player_stats <- player_stats %>%
+  left_join(allnba2, by = c("namePlayer" = "Player",
+                            "yearSeason" = "Season")) %>%
+  mutate(Share = ifelse(is.na(Share), 0, Share))
+
+# normalize stast per 100 possessions
+player_stats2 <- player_stats %>%
+  select(-minutes, -fgm, -fga, -pts, -treb) %>%
+  mutate(across(fg3m : pf, ~ 100 * .x / POSS)) 
+
+# filter so only have players that played enough
+# must have played 40 percent of team minutes and 30% of team games
+player_stats2 <- player_stats2 %>%
+  filter(Min_Pct > 0.4, pct_G > 0.3)
+```
+
+Next, we do some data processing. For the relevant variables, we transform the per 100 numbers into z-scores (grouped by year) to account for the changes across seasons. For example, there were a lot more 3-point attempts per 100 in 2023 than in 2000.
+
+To model All-NBA voting shares, I split the process into 2 parts: 1 model for giving the probability of having at least 1 vote for All-NBA, and a different model for the magnitude of the share if the player received at least 1 vote. To ensure the predictions for the magnitude are between 0 and 1, I transformed the response variable by using a logit transformation. The small adjustments I made were to subtract .001 from the numerator (so that shares of 1 would become .999 and the minimum share of .002 would still be above 0 at .001; the minimum share is .002 since there are 100 voters and the max points per voter is 5 points, so there are 500 points maximum, and the minimum number of points is 1, so 1/500 is .002). The denominator adds .001 so that shares of 1 are divided by .001 within the logarithm instead of dividing by 0. Overall, the formula for the transformed share is:
+
+$S$: voting shares
+
+$S_T$: transformed voting shares
+
+$$S_T = \log\left(\frac{S - .001}{1.001 - S}\right)$$
+
+Again, just to summarize, the only reason for the adding/subtracting of .001 was to ensure there was no dividing by 0 or taking the log of 0.
+
+```{r}
+#| label: final-processing
+
+# processing for data to predict magnitude of share
+player_stats3 <- player_stats2 %>%
+  filter(yearSeason != 2024) %>%
+  select(idPlayer, yearSeason, pct_G, Min_Pct : pf, Share) %>%
+  # convert stats to z-scores
+  group_by(yearSeason) %>%
+  mutate(across(fg3m : pf, ~ (.x - mean(.x)) / sd(.x))) %>%
+  ungroup() %>%
+  select(-POSS) %>%
+  # only include those with at least 1 vote
+  filter(Share > 0) %>%
+  # transform the share so predictions are bounded between 0 and 1
+  mutate(trans_Share = log((Share - 0.001) / (1.001 - Share)))
+
+
+# processing for data to predict whether player got a vote or not
+player_stats4 <- player_stats2 %>%
+  filter(yearSeason != 2024) %>%
+  select(idPlayer, yearSeason, pct_G, Min_Pct : pf, Share) %>%
+  # convert stats to z-scores
+  group_by(yearSeason) %>%
+  mutate(across(fg3m : pf, ~ (.x - mean(.x)) / sd(.x))) %>%
+  ungroup() %>%
+  select(-POSS) %>%
+  # create binary variable for if player got at least 1 vote
+  mutate(hasShare = ifelse(Share > 0, "Yes", "No"),
+         hasShare = factor(hasShare, levels = c("Yes", "No")))
+```
+
+## Modeling
+
+### Magnitude Fit
+
+Now it is time to specify and fit the models. Again, the models are split into 2 parts: 1 model assesses the expected magnitude of an All-NBA voting share if a player received at least 1 vote, and the other model assesses the probability of receiving at least 1 vote. We can get a final prediction for expected All-NBA awards share by multiplying the probability by the magnitude. First, we will fit the model to predict the magnitude of the share
+
+```{r}
+#| label: magnitude-fit
+
+# train-test split
+set.seed(123)
+mag_split <- initial_split(player_stats3)
+mag_train <- training(mag_split)
+mag_test <- testing(mag_split)
+
+# specify model as linear regression
+mag_spec <- linear_reg() %>%
+  set_engine("lm")
+
+# formula for model
+mag_rec <- recipe(trans_Share ~ ., data = mag_train) %>%
+  update_role(idPlayer, yearSeason, new_role = "id") %>%
+  step_rm(Share)
+
+mag_wflow <- workflow() %>%
+  add_model(mag_spec) %>%
+  add_recipe(mag_rec)
+
+# fit model
+mag_fit <- mag_wflow %>%
+  fit(mag_train)
+
+# display output
+mag_fit %>%
+  tidy() %>%
+  kable(digits = 4)
+```
+
+We can also see the model's predictiveness on both the train and test sets.
+
+```{r}
+#| label: magnitude-preds
+
+# add training set predictions
+mag_pred_train <- predict(mag_fit, new_data = mag_train) %>%
+  # convert predictions back into units of shares
+  mutate(yhat = exp(.pred) / (1 + exp(.pred))) %>%
+  bind_cols(mag_train) 
+
+# add test set predictions
+mag_pred_test <- predict(mag_fit, new_data = mag_test) %>%
+  mutate(yhat = exp(.pred) / (1 + exp(.pred))) %>%
+  bind_cols(mag_test) 
+
+# scores on train and test sets
+rsq(mag_pred_train, truth = Share, estimate = yhat)
+rsq(mag_pred_test, truth = Share, estimate = yhat)
+```
+
+We see that there is an $R^2$ of 0.729 on the training set and 0.789 on the testing set. The score is actually better on the test set, so there is not an indication of overfitting. In addition, an r-squared of about 0.8 on the test set is a sign of a solid fit.
+
+### Indicator Fit
+
+Now we model the probability of a player receiving at least 1 vote.
+
+```{r}
+#| label: indicator-fit
+
+# train test split
+set.seed(456)
+ind_split <- initial_split(player_stats4)
+ind_train <- training(ind_split)
+ind_test <- testing(ind_split)
+
+# specify logistic regression
+ind_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+# formula
+ind_rec <- recipe(hasShare ~ ., data = ind_train) %>%
+  update_role(idPlayer, yearSeason, new_role = "id") %>%
+  step_rm(Share)
+
+ind_wflow <- workflow() %>%
+  add_model(ind_spec) %>%
+  add_recipe(ind_rec)
+
+# fit model
+ind_fit <- ind_wflow %>%
+  fit(ind_train)
+
+# display output
+ind_fit %>%
+  tidy() %>%
+  kable()
+
+```
+
+And again we can look at the predictions. This time, since its a logistic regression, we use area under the ROC curve to measure predictive accuracy.
+
+```{r}
+#| label: indicator-preds
+
+# predictions for train and test set
+ind_pred_train <- predict(ind_fit, new_data = ind_train, type = "prob") %>%
+  bind_cols(ind_train) 
+
+ind_pred_test <- predict(ind_fit, new_data = ind_test, type = "prob") %>%
+  bind_cols(ind_test) 
+
+# scores for both sets
+roc_auc(ind_pred_train, truth = hasShare, .pred_Yes)
+roc_auc(ind_pred_test, truth = hasShare, .pred_Yes)
+
+```
+
+We get an ROC AUC of about 0.98 for both train and test sets. This is an indicator that this fit is pretty good at determining which players get an All-NBA vote and which ones don't. In addition, the model is unlikely to be overfit as the train and test set accuracies are very similar.
+
+## Final Fitting
+
+Lastly, we will generate the final expected predictions by fitting both models on all the players and multiplying together to get the expected share.
+
+```{r}
+#| label: final-predictions
+
+player_stats5 <- player_stats2 %>%
+  group_by(yearSeason) %>%
+  mutate(across(fg3m : pf, ~ (.x - mean(.x)) / sd(.x))) %>%
+  ungroup()
+
+# get final predictions
+final_mags <- predict(mag_fit, new_data = player_stats5) %>%
+  mutate(yhat_mag = exp(.pred) / (1 + exp(.pred)))
+final_inds <- predict(ind_fit, new_data = player_stats5, type = "prob")
+final_stats <- player_stats2 %>%
+  bind_cols(final_mags) %>%
+  bind_cols(final_inds)
+
+# multiply indicator and expected
+final_stats <- final_stats %>%
+  mutate(exp_Share = .pred_Yes * yhat_mag,
+         # will use this in next step
+         adj_Share = exp_Share)
+```
+
+There is one last thing I want to do to make the predicted All-NBA results better. If we look at the total predicted All-NBA shares per year, we see that it is not always close to 9, which is the actual total shares per year (It is 9 because a 1st team vote is 5 points, a 2nd team vote is 3 points, and a 3rd team vote in 1 point; add them up and you get 9).
+
+```{r}
+#| label: by-year
+
+final_stats %>%
+  group_by(yearSeason) %>%
+  summarize(predicted_shares = sum(adj_Share)) %>%
+  tail(15)
+```
+
+To make predictions better, we can normalize them so that there are approximately 9 total predicted shares per year.
+
+```{r}
+#| label: normalize-shares
+
+# 10 iterations
+for (i in c(1:10)) {
+  # for each player, multiply by a factor but ensure share doesn't
+  # exceed 1
+  final_stats <- final_stats %>%
+    group_by(yearSeason) %>%
+    mutate(mult = TOTAL_SHARES / sum(adj_Share), # multiplicative factor
+           adj_Share = adj_Share * mult,
+           adj_Share = ifelse(adj_Share > 1, 1, adj_Share)) %>%
+    ungroup() %>%
+    select(-mult)
+}
+```
+
+Now, after normalizing, the total predicted shares per season is much closer to 9 for all seasons.
+
+```{r}
+#| label: by-year2
+
+final_stats %>%
+  group_by(yearSeason) %>%
+  summarize(predicted_shares = sum(adj_Share)) %>%
+  tail(15)
+```
+
+Finally, we gather the results by team and season and save the rersults for 2024.
+
+```{r}
+
+# gather totals by team/season
+team_stats <- final_stats %>%
+  group_by(Tm, yearSeason) %>%
+  summarize(n = n(),
+            Shares = sum(Share),
+            exp_Shares = sum(exp_Share)) %>%
+  ungroup()
+
+# get team predictions for 2024
+allnba24 <- team_stats %>%
+  filter(yearSeason == 2024) %>%
+  select(Tm, exp_Shares)
+
+# see top few teams in total All-NBA shares for 2024
+allnba24 %>%
+  arrange(-exp_Shares) %>%
+  head()
+
+# save stats as csv
+write_csv(allnba24, "data/allnba_2024.csv")
+
+```
